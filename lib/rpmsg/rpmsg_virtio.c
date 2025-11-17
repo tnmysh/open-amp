@@ -276,6 +276,29 @@ static int rpmsg_virtio_wait_remote_ready(struct rpmsg_virtio_device *rvdev)
 	}
 }
 
+static int rpmsg_virtio_read_config(struct rpmsg_virtio_device *rvdev)
+{
+	struct rpmsg_virtio_config_space config = {0};
+	int ret;
+
+	ret = virtio_read_config(rvdev->vdev, 0, &config,
+				 RPMSG_VIRTIO_CONFIG_SIZE);
+	if (ret)
+		return RPMSG_ERR_DEV_STATE;
+
+	if (config.version != RPMSG_VIRTIO_CONFIG_VERSION ||
+	    config.size < RPMSG_VIRTIO_CONFIG_SIZE ||
+	    config.h2r_buf_size <= sizeof(struct rpmsg_hdr) ||
+	    config.r2h_buf_size <= sizeof(struct rpmsg_hdr))
+		return RPMSG_ERR_BUFF_SIZE;
+
+	rvdev->config.h2r_buf_size = config.h2r_buf_size;
+	rvdev->config.r2h_buf_size = config.r2h_buf_size;
+	rvdev->config.split_shpool = false;
+
+	return RPMSG_SUCCESS;
+}
+
 /**
  * @internal
  *
@@ -704,7 +727,9 @@ static int rpmsg_virtio_ns_callback(struct rpmsg_endpoint *ept, void *data,
 int rpmsg_virtio_get_tx_buffer_size(struct rpmsg_device *rdev)
 {
 	struct rpmsg_virtio_device *rvdev;
+	uint32_t features = 0;
 	int size = 0;
+	int ret;
 
 	if (!rdev)
 		return RPMSG_ERR_PARAM;
@@ -724,9 +749,21 @@ int rpmsg_virtio_get_tx_buffer_size(struct rpmsg_device *rdev)
 		/*
 		 * If other core is host then buffers are provided by it,
 		 * so get the buffer size from the virtqueue.
+		 * If virtio device has BUFSZ feature, then the tx buffer is
+		 * provided by the vdev config space in the resource table.
 		 */
-		size = (int)virtqueue_get_desc_size(rvdev->svq) -
-		       sizeof(struct rpmsg_hdr);
+		ret = virtio_get_features(rvdev->vdev, &features);
+		if (ret) {
+			metal_mutex_release(&rdev->lock);
+			return RPMSG_ERR_DEV_STATE;
+		}
+
+		if (features & (1U << VIRTIO_RPMSG_F_BUFSZ))
+			size = rvdev->config.r2h_buf_size -
+			       sizeof(struct rpmsg_hdr);
+		else
+			size = (int)virtqueue_get_desc_size(rvdev->svq) -
+			       sizeof(struct rpmsg_hdr);
 	}
 
 	if (size <= 0)
@@ -740,7 +777,8 @@ int rpmsg_virtio_get_tx_buffer_size(struct rpmsg_device *rdev)
 int rpmsg_virtio_get_rx_buffer_size(struct rpmsg_device *rdev)
 {
 	struct rpmsg_virtio_device *rvdev;
-	int size = 0;
+	int size = 0, ret;
+	uint32_t features = 0;
 
 	if (!rdev)
 		return RPMSG_ERR_PARAM;
@@ -760,9 +798,22 @@ int rpmsg_virtio_get_rx_buffer_size(struct rpmsg_device *rdev)
 		/*
 		 * If other core is host then buffers are provided by it,
 		 * so get the buffer size from the virtqueue.
+		 * If virtio device has BUFSZ feature, then the rx buffer is
+		 * provided by the vdev config space in the resource table.
 		 */
-		size = (int)virtqueue_get_desc_size(rvdev->rvq) -
-		       sizeof(struct rpmsg_hdr);
+		ret = virtio_get_features(rvdev->vdev, &features);
+		if (ret) {
+			metal_mutex_release(&rdev->lock);
+			return RPMSG_ERR_DEV_STATE;
+		}
+
+		if (features & (1U << VIRTIO_RPMSG_F_BUFSZ)) {
+			size = rvdev->config.h2r_buf_size -
+			       sizeof(struct rpmsg_hdr);
+		} else {
+			size = (int)virtqueue_get_desc_size(rvdev->rvq) -
+				sizeof(struct rpmsg_hdr);
+		}
 	}
 
 	if (size <= 0)
@@ -816,17 +867,6 @@ int rpmsg_init_vdev_with_config(struct rpmsg_virtio_device *rvdev,
 	rdev->ops.get_rx_buffer_size = rpmsg_virtio_get_rx_buffer_size;
 	rdev->ops.get_tx_buffer_size = rpmsg_virtio_get_tx_buffer_size;
 
-	if (VIRTIO_ROLE_IS_DRIVER(vdev)) {
-		/*
-		 * The virtio configuration contains only options applicable to
-		 * a virtio driver, implying rpmsg host role.
-		 */
-		if (config == NULL) {
-			return RPMSG_ERR_PARAM;
-		}
-		rvdev->config = *config;
-	}
-
 	if (VIRTIO_ROLE_IS_DEVICE(vdev)) {
 		/* wait synchro with the host */
 		status = rpmsg_virtio_wait_remote_ready(rvdev);
@@ -840,13 +880,28 @@ int rpmsg_init_vdev_with_config(struct rpmsg_virtio_device *rvdev,
 	rdev->support_ns = !!(features & (1 << VIRTIO_RPMSG_F_NS));
 
 	if (VIRTIO_ROLE_IS_DRIVER(vdev)) {
+		if (features & (1U << VIRTIO_RPMSG_F_BUFSZ)) {
+			status = rpmsg_virtio_read_config(rvdev);
+			if (status)
+				return status;
+		} else {
+			/*
+			 * The local configuration contains options applicable
+			 * to a virtio driver, implying rpmsg host role.
+			 */
+			if (config == NULL)
+				return RPMSG_ERR_PARAM;
+
+			rvdev->config = *config;
+		}
+
 		/*
 		 * Since device is RPMSG Remote so we need to manage the
 		 * shared buffers. Create shared memory pool to handle buffers.
 		 */
-		rvdev->shpool = config->split_shpool ? shpool + 1 : shpool;
 		if (!shpool)
 			return RPMSG_ERR_PARAM;
+		rvdev->shpool = rvdev->config.split_shpool ? shpool + 1 : shpool;
 		if (!shpool->size || !rvdev->shpool->size)
 			return RPMSG_ERR_NO_BUFF;
 
@@ -857,6 +912,12 @@ int rpmsg_init_vdev_with_config(struct rpmsg_virtio_device *rvdev,
 	}
 
 	if (VIRTIO_ROLE_IS_DEVICE(vdev)) {
+		if (features & (1U << VIRTIO_RPMSG_F_BUFSZ)) {
+			status = rpmsg_virtio_read_config(rvdev);
+			if (status)
+				return status;
+		}
+
 		vq_names[0] = "tx_vq";
 		vq_names[1] = "rx_vq";
 		callback[0] = rpmsg_virtio_tx_callback;
